@@ -47,6 +47,40 @@ WEEK_START = datetime(2025, 6, 9, 6, 0, 0)
 WEEK_DAYS = 7
 HOURS = range(7, 20)  # 7:00 through 19:00 inclusive
 
+DEMO_EXAMPLES = [
+    {
+        "title": "Executive floor emptiness",
+        "question": "Why is Floor 5 almost empty on Monday?",
+        "insight": (
+            "Security memos explain the CXO-only policy and weekend elevator locks, so the assistant "
+            "should connect badge restrictions to sparse counts."
+        ),
+        "context_gap": None,
+    },
+    {
+        "title": "Renovation blackout window",
+        "question": "What's happening with Floor 2 badge counts on June 10?",
+        "insight": (
+            "The synthetic data shows near-zero occupancy because the collaboration hub is under renovation; "
+            "this example highlights how memos reinforce the explanation."
+        ),
+        "context_gap": None,
+    },
+    {
+        "title": "Need manual event note",
+        "question": "Why will Floor 4 be blocked on July 1?",
+        "insight": (
+            "Ask about a date outside the generated week; the assistant should request an event note, "
+            "you can enter it via chat, and the follow-up answer will include the new context."
+        ),
+        "context_gap": {
+            "example_follow_up": (
+                "Enter: Floor4 eventNote = 'Partner innovation summit July 1 (floor closed to staff)'."
+            )
+        },
+    },
+]
+
 
 @dataclass
 class FloorMetadata:
@@ -728,6 +762,64 @@ class GraphQueryEngine:
         return gaps
 
 
+def _chunk_context_sections(context: str) -> List[List[str]]:
+    sections: List[List[str]] = []
+    current: List[str] = []
+    for raw_line in context.splitlines():
+        line = raw_line.strip()
+        if not line:
+            if current:
+                sections.append(current)
+                current = []
+            continue
+        current.append(line)
+    if current:
+        sections.append(current)
+    return sections
+
+
+def _section_to_sentence(section: List[str]) -> str:
+    header = section[0] if section else ""
+    purpose = label = floor_id = ""
+    match = re.match(r"(Floor\d+)\s*\(([^)]+)\):\s*purpose=([^\[]+)", header)
+    if match:
+        floor_id, label, purpose = match.groups()
+    status_line = next((line for line in section if line.startswith("Status=")), "")
+    status_match = re.match(r"Status=([^|]+)\| Reserved for ([^|]+)\| Restrictions=([^\[]+)", status_line)
+    stats_line = next((line for line in section if line.startswith("Weekly occupancy stats")), "")
+    stats_match = re.match(r"Weekly occupancy stats: avg=([0-9.]+), max=([0-9.]+), min=([0-9.]+)", stats_line)
+    snippets: List[str] = []
+    if label:
+        snippets.append(f"{label} ({floor_id}) focuses on {purpose.strip().rstrip('.').lower()}.")
+    if status_match:
+        status, reserved_for, restrictions = [part.strip().rstrip(".") for part in status_match.groups()]
+        snippets.append(f"It is currently {status.lower()} and primarily reserved for {reserved_for}.")
+        snippets.append(f"Access notes: {restrictions}.")
+    if stats_match:
+        avg, mx, mn = stats_match.groups()
+        snippets.append(
+            f"Typical hourly occupancy averages {float(avg):.0f} people with a range of {int(float(mn))}–{int(float(mx))}."
+        )
+    memo_lines = [line for line in section if line.startswith("Memo evidence")]
+    if memo_lines:
+        previews = [line.split(":", 1)[1].split("[source", 1)[0].strip() for line in memo_lines]
+        snippets.append("Memo takeaway: " + " ".join(previews))
+    vault_lines = [line for line in section if line.startswith("Context vault fact")]
+    if vault_lines:
+        previews = [line.split(":", 1)[1].split("[source", 1)[0].strip() for line in vault_lines]
+        snippets.append("Manual context: " + " ".join(previews))
+    return " ".join(snippets) if snippets else ""
+
+
+def _summarize_context(context: str) -> List[str]:
+    summaries: List[str] = []
+    for section in _chunk_context_sections(context):
+        sentence = _section_to_sentence(section)
+        if sentence:
+            summaries.append(sentence)
+    return summaries
+
+
 class LLMExplainer:
     """Answer natural language questions using graph retrieval + optional LLM."""
 
@@ -805,13 +897,15 @@ class LLMExplainer:
         return completion["choices"][0]["message"]["content"].strip()
 
     def _fallback_answer(self, question: str, context: str, error: Optional[str] = None) -> str:
-        explanation = [
-            "Offline reasoning (LLM unavailable):",
-            f"- Question: {question}",
-            "- Based on retrieved facts:",
-        ]
-        for line in context.splitlines():
-            explanation.append(f"  • {line}")
+        summaries = _summarize_context(context)
+        if summaries:
+            explanation = ["Here’s what the sensors and policy data show:"]
+            explanation.extend(f"- {sentence}" for sentence in summaries)
+        else:
+            explanation = [
+                "I tried to summarize the evidence, but I couldn't parse the context snippet.",
+                "You can still review the 'Retrieved fact sheet' for raw details.",
+            ]
         if error:
             explanation.append(f"[LLM error: {error}]")
         return "\n".join(explanation)
@@ -867,15 +961,13 @@ class LLMExplainer:
     def _gap_response_plain(
         self, question: str, gaps: Sequence[ContextGap], error: Optional[str] = None
     ) -> str:
-        lines = [
-            f"I want to explain \"{question}\", but I need a quick detail first.",
-        ]
+        lines = ["I'd love to give you a precise explanation, but I need a quick clarification first."]
         for gap in gaps:
-            lines.append(f"- {gap.reason}")
-            lines.append(f"  Could you share: {gap.suggested_question}")
-        lines.append(
-            "Reply with the detail and I'll store it so future answers include it automatically."
-        )
+            detail = gap.reason
+            polite = gap.suggested_question
+            lines.append(f"- {detail}")
+            lines.append(f"  Could you let me know: {polite}")
+        lines.append("Share the detail once, and I'll remember it for every future answer.")
         if error:
             lines.append(f"(LLM unavailable, falling back to templated wording: {error})")
         return "\n".join(lines)
@@ -1048,6 +1140,18 @@ def render_streamlit_app(bundle: Dict[str, object]) -> None:
         st.caption(
             "No manual overrides captured yet. Call `record_context_entry(...)` after gathering a clarification."
         )
+
+    st.subheader("Example walkthroughs")
+    for example in DEMO_EXAMPLES:
+        with st.expander(example["title"]):
+            st.markdown(f"**Try asking:** {example['question']}")
+            st.write(example["insight"])
+            gap_tip = example.get("context_gap")
+            if gap_tip and gap_tip.get("example_follow_up"):
+                st.info(
+                    "If the assistant asks for more detail, respond with: "
+                    f"{gap_tip['example_follow_up']}"
+                )
 
     st.subheader("Ask the context-aware assistant")
     question = st.text_input(
