@@ -41,7 +41,6 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     OpenAI = None  # type: ignore
 
-
 ARTIFACT_DIR = Path("artifacts")
 WEEK_START = datetime(2025, 6, 9, 6, 0, 0)
 WEEK_DAYS = 7
@@ -311,6 +310,7 @@ class TripletExtractor:
         self.model = model
         self.api_key = os.getenv("OPENAI_API_KEY")
         self.llm_ready = bool(self.api_key and openai)
+<<<<<<< Updated upstream
         self.client = None
         self.api_style = "legacy"
         if self.llm_ready and openai:
@@ -325,6 +325,10 @@ class TripletExtractor:
             else:
                 if hasattr(openai, "api_key"):
                     openai.api_key = self.api_key
+=======
+        if self.llm_ready and openai:
+            openai.api_key = self.api_key
+>>>>>>> Stashed changes
 
     def extract(self, memos: Sequence[str]) -> List[Dict[str, str]]:
         if self.llm_ready:
@@ -335,6 +339,10 @@ class TripletExtractor:
         return self._heuristic_extract(memos)
 
     def _extract_with_llm(self, memos: Sequence[str]) -> List[Dict[str, str]]:
+<<<<<<< Updated upstream
+=======
+        assert openai is not None  # for mypy
+>>>>>>> Stashed changes
         joined = "\n\n".join(memos)
         prompt = (
             "Extract building knowledge triplets from the memos below. "
@@ -343,6 +351,7 @@ class TripletExtractor:
             "Use short predicate names (status, reservedFor, event, restriction).\n\n"
             f"Memos:\n{joined}"
         )
+<<<<<<< Updated upstream
         content: Optional[str] = None
         if self.api_style == "client" and self.client is not None:
             response = self.client.chat.completions.create(
@@ -366,6 +375,17 @@ class TripletExtractor:
             content = response["choices"][0]["message"]["content"]
         if not content:
             raise RuntimeError("LLM content not returned")
+=======
+        response = openai.ChatCompletion.create(  # type: ignore[attr-defined]
+            model=self.model,
+            messages=[
+                {"role": "system", "content": "You convert text into RDF-style triplets."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,
+        )
+        content = response["choices"][0]["message"]["content"]
+>>>>>>> Stashed changes
         try:
             parsed = json.loads(content)
             if isinstance(parsed, list):
@@ -728,6 +748,7 @@ class LLMExplainer:
         self.model = model
         self.api_key = os.getenv("OPENAI_API_KEY")
         self.llm_ready = bool(self.api_key and openai)
+<<<<<<< Updated upstream
         self.client = None
         self.api_style = "legacy"
         if self.llm_ready and openai:
@@ -742,6 +763,10 @@ class LLMExplainer:
             else:
                 if hasattr(openai, "api_key"):
                     openai.api_key = self.api_key
+=======
+        if self.llm_ready and openai:
+            openai.api_key = self.api_key
+>>>>>>> Stashed changes
 
     def answer(self, question: str) -> Tuple[str, str]:
         context, floors, date, gaps = self.query_engine.retrieve_context(question)
@@ -757,6 +782,7 @@ class LLMExplainer:
         return fallback, context
 
     def _answer_with_llm(self, question: str, context: str) -> str:
+<<<<<<< Updated upstream
         if self.api_style == "client" and self.client is not None:
             completion = self.client.chat.completions.create(
                 model=self.model,
@@ -777,6 +803,9 @@ class LLMExplainer:
             )
             return completion.choices[0].message.content.strip()
         assert openai is not None  # fallback for mypy
+=======
+        assert openai is not None  # for mypy
+>>>>>>> Stashed changes
         completion = openai.ChatCompletion.create(  # type: ignore[attr-defined]
             model=self.model,
             messages=[
