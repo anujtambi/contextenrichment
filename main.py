@@ -911,6 +911,16 @@ def prepare_demo_data() -> Dict[str, object]:
     return _build_data_bundle()
 
 
+def _default_chatbot_message() -> Dict[str, str]:
+    return {
+        "role": "assistant",
+        "content": (
+            "Hi! I'm the context-aware assistant. Ask about occupancy anomalies, floor policies, "
+            "or memo evidence and I'll cite the knowledge graph facts I pull."
+        ),
+    }
+
+
 def render_streamlit_app(bundle: Dict[str, object]) -> None:
     if not st:
         raise RuntimeError("Streamlit is not installed. Run `pip install streamlit` first.")
@@ -930,6 +940,7 @@ def render_streamlit_app(bundle: Dict[str, object]) -> None:
         "Set the OPENAI_API_KEY env variable before launching Streamlit to enable live LLM responses."
     )
 
+    explainer: LLMExplainer = bundle["explainer"]  # type: ignore[assignment]
     occupancy_df: pd.DataFrame = bundle["occupancy_df"]  # type: ignore[assignment]
     st.subheader("Occupancy overview")
     st.caption("Synthetic sensor readings aggregated per hour for Floors 1–5, week of Jun 9, 2025.")
@@ -970,11 +981,38 @@ def render_streamlit_app(bundle: Dict[str, object]) -> None:
         value="Why is Floor 5 almost empty on Monday?",
     )
     if question:
-        answer, supporting_facts = bundle["explainer"].answer(question)  # type: ignore[assignment]
+        answer, supporting_facts = explainer.answer(question)
         st.markdown("**Answer**")
         st.write(answer)
         with st.expander("Retrieved fact sheet"):
             st.text(supporting_facts)
+
+    st.subheader("Chat with the context-aware assistant")
+    if "chat_messages" not in st.session_state:
+        st.session_state["chat_messages"] = [_default_chatbot_message()]
+    if st.button("Clear chat history", key="clear_chat_history"):
+        st.session_state["chat_messages"] = [_default_chatbot_message()]
+    chat_messages = st.session_state["chat_messages"]
+    chat_prompt = st.chat_input("Start a conversation about occupancy, policies, or memos")
+    if chat_prompt:
+        chat_messages.append({"role": "user", "content": chat_prompt})
+        answer, supporting_facts = explainer.answer(chat_prompt)
+        chat_messages.append(
+            {
+                "role": "assistant",
+                "content": answer,
+                "supporting_facts": supporting_facts,
+            }
+        )
+    for message in chat_messages:
+        role = message.get("role", "assistant")
+        content = message.get("content", "")
+        with st.chat_message(role):
+            st.markdown(content)
+            supporting = message.get("supporting_facts")
+            if supporting:
+                with st.expander("Retrieved fact sheet", expanded=False):
+                    st.text(supporting)
 
     st.caption(
         "Demo data is synthetic. Knowledge graph built with RDFLib; sensor readings linked to floor entities."
