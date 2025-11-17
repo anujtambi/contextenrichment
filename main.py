@@ -125,7 +125,6 @@ def create_floor_metadata() -> List[FloorMetadata]:
 
 def create_unstructured_context(floors: Sequence[FloorMetadata]) -> List[str]:
     """Simulate memos or news articles that mention floor facts."""
-    floor_lookup = {f.number: f for f in floors}
     return [
         (
             "Facilities bulletin (May 28): Floor 2 will remain closed for fit-out work "
@@ -434,11 +433,21 @@ class GraphQueryEngine:
         namespace: Namespace,
         occupancy_df: pd.DataFrame,
         floors: Sequence[FloorMetadata],
+        memos: Sequence[str],
+        artifacts: Dict[str, Path],
     ) -> None:
         self.graph = graph
         self.ns = namespace
         self.occupancy_df = occupancy_df
         self.floors = {f.floor_id: f for f in floors}
+        self.memos = list(memos)
+        self.artifacts = artifacts
+        self.memo_index: Dict[str, List[Tuple[int, str]]] = {}
+        for idx, memo in enumerate(self.memos):
+            mentioned = re.findall(r"floor\s*(\d)", memo, re.IGNORECASE)
+            for num in mentioned:
+                floor_id = f"Floor{num}"
+                self.memo_index.setdefault(floor_id, []).append((idx, memo.strip()))
 
     def retrieve_context(self, question: str) -> Tuple[str, List[str], Optional[datetime]]:
         floors = self._detect_floors(question)
@@ -477,27 +486,46 @@ class GraphQueryEngine:
         df = self.occupancy_df[self.occupancy_df["floor_id"] == floor_id]
         summary = df["count"].agg(["mean", "max", "min"]).to_dict()
         context_lines = [
-            f"{floor_id} ({facts['label']}): purpose={facts['purpose']}",
-            f"Status={facts['status']} | Reserved for {facts['reserved_for']} | Restrictions={facts['restrictions']}",
-            f"Weekly occupancy stats: avg={summary['mean']:.1f}, max={summary['max']}, min={summary['min']}",
+            f"{floor_id} ({facts['label']}): purpose={facts['purpose']} "
+            f"[source: {self._source_link('floor_schema_json')}]",
+            f"Status={facts['status']} | Reserved for {facts['reserved_for']} | Restrictions={facts['restrictions']} "
+            f"[source: {self._source_link('floor_schema_json')}]",
+            f"Weekly occupancy stats: avg={summary['mean']:.1f}, max={summary['max']}, min={summary['min']} "
+            f"[source: {self._source_link('occupancy_csv')}]",
         ]
         if target_date is not None:
             date_df = df[df["date"] == target_date.date()]
             if not date_df.empty:
                 context_lines.append(
                     f"On {target_date.strftime('%Y-%m-%d')} occupancy ranged "
-                    f"{date_df['count'].min()}–{date_df['count'].max()} (median {int(date_df['count'].median())})."
+                    f"{date_df['count'].min()}–{date_df['count'].max()} (median {int(date_df['count'].median())}) "
+                    f"[source: {self._source_link('occupancy_csv')}]"
                 )
             else:
                 context_lines.append(
                     f"No sensor data for {floor_id} on {target_date.strftime('%Y-%m-%d')}."
                 )
+        context_lines.extend(self._memo_snippets(floor_id))
         return "\n".join(context_lines)
 
     def _first_literal(self, subject: URIRef, predicate: URIRef) -> str:
         for _, _, obj in self.graph.triples((subject, predicate, None)):
             return str(obj)
         return "Unknown"
+
+    def _memo_snippets(self, floor_id: str) -> List[str]:
+        snippets: List[str] = []
+        for idx, memo in self.memo_index.get(floor_id, []):
+            excerpt = memo if len(memo) <= 220 else memo[:217] + "..."
+            snippets.append(
+                f"Memo evidence #{idx + 1}: {excerpt} "
+                f"[source: {self._source_link('memos_txt')}#memo-{idx + 1}]"
+            )
+        return snippets
+
+    def _source_link(self, key: str) -> str:
+        path = self.artifacts.get(key)
+        return path.as_posix() if path else key
 
 
 class LLMExplainer:
@@ -568,7 +596,7 @@ def _build_data_bundle() -> Dict[str, object]:
 
     builder = KnowledgeGraphBuilder(floors, occupancy_df, memos, triplets, floor_schema)
     graph = builder.build()
-    query_engine = GraphQueryEngine(graph, builder.ns, occupancy_df, floors)
+    query_engine = GraphQueryEngine(graph, builder.ns, occupancy_df, floors, memos, artifact_paths)
     explainer = LLMExplainer(query_engine)
 
     return {
