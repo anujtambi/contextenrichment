@@ -888,7 +888,19 @@ def record_context_entry(
 
 
 def is_streamlit_runtime() -> bool:
-    return bool(st and getattr(st, "_is_running_with_streamlit", False))
+    if not st:
+        return False
+    try:
+        from streamlit import runtime
+        return bool(runtime.exists())
+    except Exception:
+        attr = getattr(st, "_is_running_with_streamlit", None)
+        if callable(attr):
+            try:
+                return bool(attr())
+            except Exception:
+                return False
+        return bool(attr)
 
 
 def prepare_demo_data() -> Dict[str, object]:
