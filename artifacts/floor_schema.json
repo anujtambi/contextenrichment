@@ -1,0 +1,58 @@
+{
+  "building": {
+    "name": "Cisco Spaces HQ (Demo Tower)",
+    "address": "170 W Tasman Dr, San Jose, CA"
+  },
+  "floors": [
+    {
+      "floorId": "Floor1",
+      "number": 1,
+      "label": "Lobby & Visitor Pavilion",
+      "purpose": "Reception, visitor management, cafe, experience center",
+      "reservedFor": "AllEmployeesAndGuests",
+      "status": "Open",
+      "notes": "Hosts daily executive briefings and high-volume cafe traffic.",
+      "restrictions": "Visitor badge required past turnstiles."
+    },
+    {
+      "floorId": "Floor2",
+      "number": 2,
+      "label": "Collaboration Hub (Under Renovation)",
+      "purpose": "Agile project rooms and large briefing studio",
+      "reservedFor": "FacilitiesTeamOnly",
+      "status": "Renovation (Jun 1\u201315)",
+      "notes": "Construction crews modernizing briefing studio; sensors stay online for safety compliance.",
+      "restrictions": "Hard-hat access, max 10 people per hour."
+    },
+    {
+      "floorId": "Floor3",
+      "number": 3,
+      "label": "Innovation & Engineering Pods",
+      "purpose": "Software engineering, hack spaces, UX labs",
+      "reservedFor": "ProductEngineering",
+      "status": "Open",
+      "notes": "Hosts rotating hackathons; busiest Tues\u2013Thu afternoons.",
+      "restrictions": "Badge + NDA for lab wing."
+    },
+    {
+      "floorId": "Floor4",
+      "number": 4,
+      "label": "Customer Experience Center",
+      "purpose": "Partner enablement, demo theaters, training",
+      "reservedFor": "CXEnablement",
+      "status": "Open",
+      "notes": "Peak demand around on-site trainings; steady but moderate.",
+      "restrictions": "Escort visitors outside of demo zones."
+    },
+    {
+      "floorId": "Floor5",
+      "number": 5,
+      "label": "Executive Offices (CXOs only)",
+      "purpose": "Executive offices, boardroom, strategy war-room",
+      "reservedFor": "ExecutiveLeadership",
+      "status": "Restricted",
+      "notes": "Badge restricted; typically empty on weekends and evenings.",
+      "restrictions": "24/7 security post, invite-only access."
+    }
+  ]
+}
