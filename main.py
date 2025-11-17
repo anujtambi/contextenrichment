@@ -57,6 +57,69 @@ class FloorMetadata:
     preferred_peak_hour: int
 
 
+@dataclass
+class ContextGap:
+    reason: str
+    suggested_question: str
+    peer_hint: str
+
+
+class ContextVault:
+    """Persistent store for user-supplied context enrichments."""
+
+    def __init__(self, path: Path = ARTIFACT_DIR / "context_overrides.json") -> None:
+        self.path = path
+        self.entries: List[Dict[str, str]] = self._load()
+
+    def _load(self) -> List[Dict[str, str]]:
+        if self.path.exists():
+            try:
+                with open(self.path, "r", encoding="utf-8") as fp:
+                    data = json.load(fp)
+                    if isinstance(data, list):
+                        return data
+            except Exception as exc:
+                print(f"[ContextVault] Failed to read overrides ({exc}); starting fresh.")
+        return []
+
+    def _save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.path, "w", encoding="utf-8") as fp:
+            json.dump(self.entries, fp, indent=2)
+
+    def add_entry(
+        self,
+        floor_id: str,
+        predicate: str,
+        value: str,
+        source_note: str = "user_follow_up",
+    ) -> Dict[str, str]:
+        entry = {
+            "floor_id": floor_id,
+            "predicate": predicate,
+            "value": value,
+            "source_note": source_note,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        self.entries.append(entry)
+        self._save()
+        return entry
+
+    def facts_for_floor(self, floor_id: str) -> List[Dict[str, str]]:
+        return [entry for entry in self.entries if entry["floor_id"] == floor_id]
+
+    def apply_to_graph(self, graph: Graph, ns: Namespace, floor_nodes: Dict[str, URIRef]) -> None:
+        for entry in self.entries:
+            subj = floor_nodes.get(entry["floor_id"])
+            if subj is None:
+                continue
+            predicate = ns[entry["predicate"]]
+            graph.add((subj, predicate, Literal(entry["value"])))
+
+    def as_list(self) -> List[Dict[str, str]]:
+        return list(self.entries)
+
+
 def create_floor_metadata() -> List[FloorMetadata]:
     """Define the structured schema for each floor."""
     return [
@@ -330,6 +393,7 @@ class KnowledgeGraphBuilder:
         memos: Sequence[str],
         triplets: Sequence[Dict[str, str]],
         floor_schema: Dict[str, object],
+        context_vault: Optional[ContextVault] = None,
     ) -> None:
         self.floors = floors
         self.occupancy_df = occupancy_df
@@ -339,6 +403,7 @@ class KnowledgeGraphBuilder:
         self.graph = Graph()
         self.ns = Namespace("https://cisco-spaces.demo/graph#")
         self.floor_nodes: Dict[str, URIRef] = {}
+        self.context_vault = context_vault
 
     def build(self) -> Graph:
         self.graph.bind("spaces", self.ns)
@@ -347,6 +412,7 @@ class KnowledgeGraphBuilder:
         self._add_unstructured_triplets()
         self._add_memos()
         self._link_sensor_records()
+        self._include_context_vault()
         return self.graph
 
     def _add_floors(self) -> None:
@@ -411,6 +477,11 @@ class KnowledgeGraphBuilder:
             self.graph.add((reading_node, self.ns.sensorId, Literal(row["sensor_id"])))
             self.graph.add((reading_node, self.ns.observedOn, floor_node))
 
+    def _include_context_vault(self) -> None:
+        if not self.context_vault:
+            return
+        self.context_vault.apply_to_graph(self.graph, self.ns, self.floor_nodes)
+
     def stats(self) -> Dict[str, int]:
         return {
             "triples": len(self.graph),
@@ -426,6 +497,17 @@ class GraphQueryEngine:
     FLOOR_PATTERN = re.compile(r"floor\s*(\d)", re.IGNORECASE)
     DATE_PATTERN = re.compile(r"(June|Jun)\s+(\d{1,2})", re.IGNORECASE)
     MONTHS = {"june": 6, "jun": 6}
+    PEER_HINTS = {
+        "floor_profile": (
+            "Peer insight: Workplace Ops teams log a short floor profile (purpose, badge policy, critical rooms)."
+        ),
+        "date_event": (
+            "Peer insight: Leading customers track blackout dates like renovations or summits next to occupancy exports."
+        ),
+        "policy_note": (
+            "Peer insight: Clients attach memo-style policy notes (e.g., 'CXO-only after 6pm') to each floor entity."
+        ),
+    }
 
     def __init__(
         self,
@@ -435,6 +517,7 @@ class GraphQueryEngine:
         floors: Sequence[FloorMetadata],
         memos: Sequence[str],
         artifacts: Dict[str, Path],
+        context_vault: Optional[ContextVault] = None,
     ) -> None:
         self.graph = graph
         self.ns = namespace
@@ -442,6 +525,7 @@ class GraphQueryEngine:
         self.floors = {f.floor_id: f for f in floors}
         self.memos = list(memos)
         self.artifacts = artifacts
+        self.context_vault = context_vault
         self.memo_index: Dict[str, List[Tuple[int, str]]] = {}
         for idx, memo in enumerate(self.memos):
             mentioned = re.findall(r"floor\s*(\d)", memo, re.IGNORECASE)
@@ -449,8 +533,12 @@ class GraphQueryEngine:
                 floor_id = f"Floor{num}"
                 self.memo_index.setdefault(floor_id, []).append((idx, memo.strip()))
 
-    def retrieve_context(self, question: str) -> Tuple[str, List[str], Optional[datetime]]:
-        floors = self._detect_floors(question)
+    def retrieve_context(
+        self, question: str
+    ) -> Tuple[str, List[str], Optional[datetime], List[ContextGap]]:
+        requested_floors = self._detect_floors(question)
+        missing_floors = [f for f in requested_floors if f not in self.floors]
+        floors = [f for f in requested_floors if f in self.floors]
         date = self._detect_date(question)
         if not floors:
             floors = list(self.floors.keys())
@@ -458,11 +546,17 @@ class GraphQueryEngine:
         snippets: List[str] = []
         for floor_id in floors:
             snippets.append(self._format_floor_context(floor_id, date))
-        return "\n\n".join(snippets), floors, date
+
+        gaps: List[ContextGap] = []
+        gaps.extend(self._floor_gaps(missing_floors))
+        gaps.extend(self._date_gaps(floors, date))
+        gaps.extend(self._policy_gaps(requested_floors or floors))
+
+        return "\n\n".join(snippets), floors, date, gaps
 
     def _detect_floors(self, question: str) -> List[str]:
         matches = self.FLOOR_PATTERN.findall(question)
-        return [f"Floor{m}" for m in matches if f"Floor{m}" in self.floors]
+        return [f"Floor{m}" for m in matches]
 
     def _detect_date(self, question: str) -> Optional[datetime]:
         match = self.DATE_PATTERN.search(question)
@@ -506,6 +600,7 @@ class GraphQueryEngine:
                     f"No sensor data for {floor_id} on {target_date.strftime('%Y-%m-%d')}."
                 )
         context_lines.extend(self._memo_snippets(floor_id))
+        context_lines.extend(self._vault_snippets(floor_id))
         return "\n".join(context_lines)
 
     def _first_literal(self, subject: URIRef, predicate: URIRef) -> str:
@@ -527,6 +622,73 @@ class GraphQueryEngine:
         path = self.artifacts.get(key)
         return path.as_posix() if path else key
 
+    def _vault_snippets(self, floor_id: str) -> List[str]:
+        if not self.context_vault:
+            return []
+        snippets: List[str] = []
+        for idx, entry in enumerate(self.context_vault.facts_for_floor(floor_id), start=1):
+            snippets.append(
+                f"Context vault fact #{idx}: {entry['predicate']}={entry['value']} "
+                f"(added {entry['timestamp']}, note={entry.get('source_note', 'user')}) "
+                f"[source: {self._source_link('context_overrides_json')}]"
+            )
+        return snippets
+
+    def _floor_gaps(self, missing_floors: Sequence[str]) -> List[ContextGap]:
+        gaps: List[ContextGap] = []
+        for floor_id in missing_floors:
+            gaps.append(
+                ContextGap(
+                    reason=f"{floor_id} is not modeled in the current building graph.",
+                    suggested_question=(
+                        f"Can you summarize {floor_id}'s purpose, access policy, and monitoring status?"
+                    ),
+                    peer_hint=self.PEER_HINTS["floor_profile"],
+                )
+            )
+        return gaps
+
+    def _date_gaps(self, floors: Sequence[str], target_date: Optional[datetime]) -> List[ContextGap]:
+        gaps: List[ContextGap] = []
+        if not target_date:
+            return gaps
+        for floor_id in floors:
+            date_df = self.occupancy_df[
+                (self.occupancy_df["floor_id"] == floor_id)
+                & (self.occupancy_df["date"] == target_date.date())
+            ]
+            if date_df.empty:
+                gaps.append(
+                    ContextGap(
+                        reason=(
+                            f"No sensor coverage for {floor_id} on {target_date.strftime('%Y-%m-%d')}."
+                        ),
+                        suggested_question=(
+                            f"Was {floor_id} under maintenance, blocked badges, or a special event on "
+                            f"{target_date.strftime('%b %d')}?"
+                        ),
+                        peer_hint=self.PEER_HINTS["date_event"],
+                    )
+                )
+        return gaps
+
+    def _policy_gaps(self, floors: Sequence[str]) -> List[ContextGap]:
+        gaps: List[ContextGap] = []
+        for floor_id in floors:
+            has_memo = bool(self.memo_index.get(floor_id))
+            has_vault = bool(self.context_vault and self.context_vault.facts_for_floor(floor_id))
+            if not has_memo and not has_vault:
+                gaps.append(
+                    ContextGap(
+                        reason=f"{floor_id} lacks memo evidence or manual overrides.",
+                        suggested_question=(
+                            f"Could you share a short note about {floor_id}'s operating norms or current projects?"
+                        ),
+                        peer_hint=self.PEER_HINTS["policy_note"],
+                    )
+                )
+        return gaps
+
 
 class LLMExplainer:
     """Answer natural language questions using graph retrieval + optional LLM."""
@@ -540,7 +702,9 @@ class LLMExplainer:
             openai.api_key = self.api_key
 
     def answer(self, question: str) -> Tuple[str, str]:
-        context, floors, date = self.query_engine.retrieve_context(question)
+        context, floors, date, gaps = self.query_engine.retrieve_context(question)
+        if gaps:
+            return self._gap_response(question, gaps), context
         if self.llm_ready:
             try:
                 return self._answer_with_llm(question, context), context
@@ -583,20 +747,47 @@ class LLMExplainer:
             explanation.append(f"[LLM error: {error}]")
         return "\n".join(explanation)
 
+    def _gap_response(self, question: str, gaps: Sequence[ContextGap]) -> str:
+        lines = [
+            "Additional context required before I can explain confidently:",
+            f"- Original question: {question}",
+        ]
+        for idx, gap in enumerate(gaps, start=1):
+            lines.append(
+                f"{idx}. Reason: {gap.reason}\n   Ask the user: {gap.suggested_question}\n   {gap.peer_hint}"
+            )
+        lines.append(
+            "Once answered, call `record_context_entry(floor_id, predicate, value, source_note)` "
+            "and re-run the analysis so the new fact persists in `artifacts/context_overrides.json`."
+        )
+        return "\n".join(lines)
+
 
 def _build_data_bundle() -> Dict[str, object]:
     floors = create_floor_metadata()
     memos = create_unstructured_context(floors)
     floor_schema = floor_schema_to_json(floors)
     occupancy_df = generate_occupancy_dataframe(floors)
+    context_vault = ContextVault()
     artifact_paths = persist_artifacts(occupancy_df, floor_schema, memos)
+    artifact_paths["context_overrides_json"] = context_vault.path
 
     extractor = TripletExtractor()
     triplets = extractor.extract(memos)
 
-    builder = KnowledgeGraphBuilder(floors, occupancy_df, memos, triplets, floor_schema)
+    builder = KnowledgeGraphBuilder(
+        floors, occupancy_df, memos, triplets, floor_schema, context_vault=context_vault
+    )
     graph = builder.build()
-    query_engine = GraphQueryEngine(graph, builder.ns, occupancy_df, floors, memos, artifact_paths)
+    query_engine = GraphQueryEngine(
+        graph,
+        builder.ns,
+        occupancy_df,
+        floors,
+        memos,
+        artifact_paths,
+        context_vault=context_vault,
+    )
     explainer = LLMExplainer(query_engine)
 
     return {
@@ -609,7 +800,30 @@ def _build_data_bundle() -> Dict[str, object]:
         "graph_stats": builder.stats(),
         "artifacts": artifact_paths,
         "explainer": explainer,
+        "context_vault": context_vault,
     }
+
+
+def record_context_entry(
+    floor_id: str,
+    predicate: str,
+    value: str,
+    source_note: str = "user_follow_up",
+) -> Dict[str, str]:
+    """
+    Persist a manual context fact that will be merged into the knowledge graph on the next run.
+
+    Example:
+        record_context_entry(
+            "Floor4",
+            "eventNote",
+            "Partner innovation summit July 1 (floor closed to staff)",
+            "Facilities reply 2025-11-17",
+        )
+    """
+    vault = ContextVault()
+    entry = vault.add_entry(floor_id, predicate, value, source_note)
+    return entry
 
 
 def is_streamlit_runtime() -> bool:
@@ -668,6 +882,15 @@ def render_streamlit_app(bundle: Dict[str, object]) -> None:
         }
     )
 
+    st.subheader("Manual context overrides")
+    vault_entries = bundle["context_vault"].as_list()  # type: ignore[assignment]
+    if vault_entries:
+        st.json(vault_entries)
+    else:
+        st.caption(
+            "No manual overrides captured yet. Call `record_context_entry(...)` after gathering a clarification."
+        )
+
     st.subheader("Ask the context-aware assistant")
     question = st.text_input(
         "Type a question about occupancy anomalies",
@@ -690,6 +913,8 @@ def run_cli_summary(bundle: Dict[str, object]) -> None:
     print(f"- Synthetic occupancy rows: {len(bundle['occupancy_df'])}")
     print(f"- Knowledge graph triples: {bundle['graph_stats']['triples']}")
     print(f"- Triplets extracted from text: {len(bundle['triplets'])}")
+    vault_entries = bundle["context_vault"].as_list()  # type: ignore[assignment]
+    print(f"- Manual context overrides stored: {len(vault_entries)}")
     print("- Saved artifacts:")
     for label, path in bundle["artifacts"].items():  # type: ignore[assignment]
         print(f"  • {label}: {path}")
