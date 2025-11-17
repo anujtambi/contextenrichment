@@ -1,0 +1,5 @@
+streamlit>=1.51,<2
+pandas>=2.3,<3
+numpy>=2.3,<3
+rdflib>=7.0,<8
+openai>=2.0,<3
