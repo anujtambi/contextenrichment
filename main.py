@@ -67,6 +67,8 @@ class ContextGap:
     reason: str
     suggested_question: str
     peer_hint: str
+    floor_id: Optional[str] = None
+    predicate: Optional[str] = None
 
 
 class ContextVault:
@@ -674,6 +676,8 @@ class GraphQueryEngine:
                         f"Can you summarize {floor_id}'s purpose, access policy, and monitoring status?"
                     ),
                     peer_hint=self.PEER_HINTS["floor_profile"],
+                    floor_id=floor_id,
+                    predicate="floorProfile",
                 )
             )
         return gaps
@@ -698,6 +702,8 @@ class GraphQueryEngine:
                             f"{target_date.strftime('%b %d')}?"
                         ),
                         peer_hint=self.PEER_HINTS["date_event"],
+                        floor_id=floor_id,
+                        predicate="eventNote",
                     )
                 )
         return gaps
@@ -715,6 +721,8 @@ class GraphQueryEngine:
                             f"Could you share a short note about {floor_id}'s operating norms or current projects?"
                         ),
                         peer_hint=self.PEER_HINTS["policy_note"],
+                        floor_id=floor_id,
+                        predicate="policyNote",
                     )
                 )
         return gaps
@@ -743,18 +751,18 @@ class LLMExplainer:
                 if hasattr(openai, "api_key"):
                     openai.api_key = self.api_key
 
-    def answer(self, question: str) -> Tuple[str, str]:
+    def answer(self, question: str) -> Tuple[str, str, List[ContextGap]]:
         context, floors, date, gaps = self.query_engine.retrieve_context(question)
         if gaps:
-            return self._gap_response(question, gaps), context
+            return self._gap_response(question, gaps), context, list(gaps)
         if self.llm_ready:
             try:
-                return self._answer_with_llm(question, context), context
+                return self._answer_with_llm(question, context), context, []
             except Exception as exc:  # pragma: no cover - depends on external API
                 fallback = self._fallback_answer(question, context, error=str(exc))
-                return fallback, context
+                return fallback, context, []
         fallback = self._fallback_answer(question, context)
-        return fallback, context
+        return fallback, context, []
 
     def _answer_with_llm(self, question: str, context: str) -> str:
         if self.api_style == "client" and self.client is not None:
@@ -809,18 +817,67 @@ class LLMExplainer:
         return "\n".join(explanation)
 
     def _gap_response(self, question: str, gaps: Sequence[ContextGap]) -> str:
-        lines = [
-            "Additional context required before I can explain confidently:",
-            f"- Original question: {question}",
+        if self.llm_ready:
+            try:
+                return self._gap_response_with_llm(question, gaps)
+            except Exception as exc:  # pragma: no cover
+                return self._gap_response_plain(question, gaps, error=str(exc))
+        return self._gap_response_plain(question, gaps)
+
+    def _gap_response_with_llm(self, question: str, gaps: Sequence[ContextGap]) -> str:
+        payload = [
+            {
+                "reason": gap.reason,
+                "ask": gap.suggested_question,
+                "peer_hint": gap.peer_hint,
+                "floor_id": gap.floor_id,
+                "predicate": gap.predicate,
+            }
+            for gap in gaps
         ]
-        for idx, gap in enumerate(gaps, start=1):
-            lines.append(
-                f"{idx}. Reason: {gap.reason}\n   Ask the user: {gap.suggested_question}\n   {gap.peer_hint}"
-            )
-        lines.append(
-            "Once answered, call `record_context_entry(floor_id, predicate, value, source_note)` "
-            "and re-run the analysis so the new fact persists in `artifacts/context_overrides.json`."
+        prompt = (
+            "You are a friendly workplace analyst. You cannot answer yet because specific context "
+            "is missing. Using the structured gap list below, craft a short natural-language reply "
+            "that (1) explains why more info is needed and (2) asks the user the follow-up question(s). "
+            "Keep it concise (<=120 words) and mention floors or dates explicitly.\n\n"
+            f"Original question: {question}\n"
+            f"Gaps JSON:\n{json.dumps(payload, indent=2)}"
         )
+        if self.api_style == "client" and self.client is not None:
+            completion = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You request clarifying workplace context in natural language."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.3,
+            )
+            return completion.choices[0].message.content.strip()
+        assert openai is not None
+        completion = openai.ChatCompletion.create(  # type: ignore[attr-defined]
+            model=self.model,
+            messages=[
+                {"role": "system", "content": "You request clarifying workplace context in natural language."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.3,
+        )
+        return completion["choices"][0]["message"]["content"].strip()
+
+    def _gap_response_plain(
+        self, question: str, gaps: Sequence[ContextGap], error: Optional[str] = None
+    ) -> str:
+        lines = [
+            f"I want to explain \"{question}\", but I need a quick detail first.",
+        ]
+        for gap in gaps:
+            lines.append(f"- {gap.reason}")
+            lines.append(f"  Could you share: {gap.suggested_question}")
+        lines.append(
+            "Reply with the detail and I'll store it so future answers include it automatically."
+        )
+        if error:
+            lines.append(f"(LLM unavailable, falling back to templated wording: {error})")
         return "\n".join(lines)
 
 
@@ -921,6 +978,18 @@ def _default_chatbot_message() -> Dict[str, str]:
     }
 
 
+def _gap_to_pending_request(question: str, gap: ContextGap) -> Optional[Dict[str, str]]:
+    if not gap.floor_id or not gap.predicate:
+        return None
+    return {
+        "question": question,
+        "floor_id": gap.floor_id,
+        "predicate": gap.predicate,
+        "prompt": gap.suggested_question,
+        "reason": gap.reason,
+    }
+
+
 def render_streamlit_app(bundle: Dict[str, object]) -> None:
     if not st:
         raise RuntimeError("Streamlit is not installed. Run `pip install streamlit` first.")
@@ -931,6 +1000,11 @@ def render_streamlit_app(bundle: Dict[str, object]) -> None:
         "This dashboard fabricates a week's worth of multi-floor occupancy, enriches it "
         "with floor policies and memos, and uses a knowledge graph to answer questions."
     )
+
+    def _refresh_bundle() -> Dict[str, object]:
+        updated = _build_data_bundle()
+        st.session_state["data_bundle"] = updated
+        return updated
 
     artifacts: Dict[str, Path] = bundle["artifacts"]  # type: ignore[assignment]
     st.sidebar.header("Saved artifacts")
@@ -981,7 +1055,7 @@ def render_streamlit_app(bundle: Dict[str, object]) -> None:
         value="Why is Floor 5 almost empty on Monday?",
     )
     if question:
-        answer, supporting_facts = explainer.answer(question)
+        answer, supporting_facts, _ = explainer.answer(question)
         st.markdown("**Answer**")
         st.write(answer)
         with st.expander("Retrieved fact sheet"):
@@ -990,13 +1064,38 @@ def render_streamlit_app(bundle: Dict[str, object]) -> None:
     st.subheader("Chat with the context-aware assistant")
     if "chat_messages" not in st.session_state:
         st.session_state["chat_messages"] = [_default_chatbot_message()]
+    if "pending_context_request" not in st.session_state:
+        st.session_state["pending_context_request"] = None
     if st.button("Clear chat history", key="clear_chat_history"):
         st.session_state["chat_messages"] = [_default_chatbot_message()]
+        st.session_state["pending_context_request"] = None
     chat_messages = st.session_state["chat_messages"]
     chat_prompt = st.chat_input("Start a conversation about occupancy, policies, or memos")
     if chat_prompt:
         chat_messages.append({"role": "user", "content": chat_prompt})
-        answer, supporting_facts = explainer.answer(chat_prompt)
+        pending_request = st.session_state.get("pending_context_request")
+        handled_context = False
+        if pending_request and pending_request.get("floor_id") and pending_request.get("predicate"):
+            recorded = record_context_entry(
+                pending_request["floor_id"],
+                pending_request["predicate"],
+                chat_prompt,
+                source_note="chat_follow_up",
+            )
+            st.session_state["pending_context_request"] = None
+            bundle = _refresh_bundle()
+            explainer = bundle["explainer"]  # type: ignore[assignment]
+            handled_context = True
+            ack = (
+                f"Thanks! I logged `{recorded['predicate']}` for {recorded['floor_id']}: "
+                f"\"{recorded['value']}\". Re-running your earlier question now."
+            )
+            chat_messages.append({"role": "assistant", "content": ack})
+            question_to_reanswer = pending_request.get("question", chat_prompt)
+            answer, supporting_facts, gaps = explainer.answer(question_to_reanswer)
+        else:
+            answer, supporting_facts, gaps = explainer.answer(chat_prompt)
+            question_to_reanswer = chat_prompt
         chat_messages.append(
             {
                 "role": "assistant",
@@ -1004,6 +1103,11 @@ def render_streamlit_app(bundle: Dict[str, object]) -> None:
                 "supporting_facts": supporting_facts,
             }
         )
+        if gaps:
+            next_request = _gap_to_pending_request(question_to_reanswer, gaps[0])
+            st.session_state["pending_context_request"] = next_request
+        elif handled_context:
+            st.session_state["pending_context_request"] = None
     for message in chat_messages:
         role = message.get("role", "assistant")
         content = message.get("content", "")
