@@ -41,6 +41,7 @@ ARTIFACT_DIR = Path("artifacts")
 WEEK_START = datetime(2025, 6, 9, 6, 0, 0)
 WEEK_DAYS = 7
 HOURS = range(7, 20)  # 7:00 through 19:00 inclusive
+TABLE_REQUEST_PATTERN = re.compile(r"\b(table|tabular|grid|matrix)\b", re.IGNORECASE)
 
 DEMO_EXAMPLES = [
     {
@@ -335,6 +336,37 @@ def persist_artifacts(
     return {"occupancy_csv": csv_path, "floor_schema_json": json_path, "memos_txt": memos_path}
 
 
+def create_floor_summary_df(
+    floors: Sequence[FloorMetadata], occupancy_df: pd.DataFrame
+) -> pd.DataFrame:
+    summary = (
+        occupancy_df.groupby("floor_id")["count"]
+        .agg(mean="mean", max="max", min="min")
+        .reset_index()
+    )
+    floor_lookup = {f.floor_id: f for f in floors}
+    summary["label"] = summary["floor_id"].map(lambda fid: floor_lookup[fid].label)
+    summary["status"] = summary["floor_id"].map(lambda fid: floor_lookup[fid].status)
+    summary["reserved_for"] = summary["floor_id"].map(lambda fid: floor_lookup[fid].reserved_for)
+    summary["mean"] = summary["mean"].round(1)
+    summary["max"] = summary["max"].round().astype(int)
+    summary["min"] = summary["min"].round().astype(int)
+    summary = summary[
+        ["floor_id", "label", "status", "reserved_for", "mean", "max", "min"]
+    ].rename(
+        columns={
+            "floor_id": "Floor",
+            "label": "Label",
+            "status": "Status",
+            "reserved_for": "ReservedFor",
+            "mean": "AvgOccupancy",
+            "max": "Peak",
+            "min": "Low",
+        }
+    )
+    return summary
+
+
 class TripletExtractor:
     """Extract subject-predicate-object triplets from unstructured memos."""
 
@@ -561,6 +593,7 @@ class GraphQueryEngine:
         floors: Sequence[FloorMetadata],
         memos: Sequence[str],
         artifacts: Dict[str, Path],
+        floor_summary_df: pd.DataFrame,
         context_vault: Optional[ContextVault] = None,
     ) -> None:
         self.graph = graph
@@ -570,6 +603,7 @@ class GraphQueryEngine:
         self.memos = list(memos)
         self.artifacts = artifacts
         self.context_vault = context_vault
+        self.floor_summary_df = floor_summary_df.copy()
         self.memo_index: Dict[str, List[Tuple[int, str]]] = {}
         for idx, memo in enumerate(self.memos):
             mentioned = re.findall(r"floor\s*(\d)", memo, re.IGNORECASE)
@@ -694,6 +728,22 @@ class GraphQueryEngine:
             )
         return gaps
 
+    def floor_summary_dataframe(self) -> pd.DataFrame:
+        return self.floor_summary_df.copy()
+
+    def floor_summary_markdown(self) -> str:
+        df = self.floor_summary_df[["Floor", "Label", "Status", "AvgOccupancy", "Peak", "Low"]]
+        lines = [
+            "| Floor | Label | Status | Avg | Peak | Low |",
+            "| --- | --- | --- | ---: | ---: | ---: |",
+        ]
+        for _, row in df.iterrows():
+            lines.append(
+                f"| {row['Floor']} | {row['Label']} | {row['Status']} | "
+                f"{row['AvgOccupancy']:.1f} | {int(row['Peak'])} | {int(row['Low'])} |"
+            )
+        return "\n".join(lines)
+
     def _date_gaps(self, floors: Sequence[str], target_date: Optional[datetime]) -> List[ContextGap]:
         gaps: List[ContextGap] = []
         if not target_date:
@@ -816,16 +866,29 @@ class LLMExplainer:
 
     def answer(self, question: str) -> Tuple[str, str, List[ContextGap]]:
         context, floors, date, gaps = self.query_engine.retrieve_context(question)
+        wants_table = bool(TABLE_REQUEST_PATTERN.search(question))
+        table_markdown = self.query_engine.floor_summary_markdown() if wants_table else ""
+        reasoning_context = context
+        if table_markdown:
+            reasoning_context = (
+                f"{context}\n\nFloor summary table (Markdown):\n{table_markdown}\n"
+                "Please include this table (or a faithful subset) in your response."
+            )
         if gaps:
-            return self._gap_response(question, gaps), context, list(gaps)
-        if self.llm_ready:
-            try:
-                return self._answer_with_llm(question, context), context, []
-            except Exception as exc:  # pragma: no cover - depends on external API
-                fallback = self._fallback_answer(question, context, error=str(exc))
-                return fallback, context, []
-        fallback = self._fallback_answer(question, context)
-        return fallback, context, []
+            answer_text = self._gap_response(question, gaps)
+            gap_list = list(gaps)
+        else:
+            gap_list = []
+            if self.llm_ready:
+                try:
+                    answer_text = self._answer_with_llm(question, reasoning_context)
+                except Exception as exc:  # pragma: no cover - depends on external API
+                    answer_text = self._fallback_answer(question, reasoning_context, error=str(exc))
+            else:
+                answer_text = self._fallback_answer(question, reasoning_context)
+        if table_markdown:
+            answer_text = f"{answer_text}\n\nRequested table:\n{table_markdown}"
+        return answer_text, context, gap_list
 
     def _answer_with_llm(self, question: str, context: str) -> str:
         if not self.client:
@@ -924,7 +987,15 @@ def _build_data_bundle() -> Dict[str, object]:
     memos = create_unstructured_context(floors)
     floor_schema = floor_schema_to_json(floors)
     occupancy_df = generate_occupancy_dataframe(floors)
+    floor_summary_df = create_floor_summary_df(floors, occupancy_df)
     context_vault = ContextVault()
+    if not context_vault.entries:
+        context_vault.add_entry(
+            "Floor4",
+            "eventNote",
+            "Partner innovation summit July 1 (floor closed to staff)",
+            "demo_seed",
+        )
     artifact_paths = persist_artifacts(occupancy_df, floor_schema, memos)
     artifact_paths["context_overrides_json"] = context_vault.path
 
@@ -942,6 +1013,7 @@ def _build_data_bundle() -> Dict[str, object]:
         floors,
         memos,
         artifact_paths,
+        floor_summary_df,
         context_vault=context_vault,
     )
     explainer = LLMExplainer(query_engine)
@@ -957,6 +1029,7 @@ def _build_data_bundle() -> Dict[str, object]:
         "artifacts": artifact_paths,
         "explainer": explainer,
         "context_vault": context_vault,
+        "floor_summary": floor_summary_df,
     }
 
 
@@ -1054,6 +1127,7 @@ def render_streamlit_app(bundle: Dict[str, object]) -> None:
 
     explainer: LLMExplainer = bundle["explainer"]  # type: ignore[assignment]
     occupancy_df: pd.DataFrame = bundle["occupancy_df"]  # type: ignore[assignment]
+    floor_summary_df: pd.DataFrame = bundle["floor_summary"]  # type: ignore[assignment]
     st.subheader("Occupancy overview")
     st.caption("Synthetic sensor readings aggregated per hour for Floors 1–5, week of Jun 9, 2025.")
     st.dataframe(occupancy_df.head(20))
@@ -1062,6 +1136,9 @@ def render_streamlit_app(bundle: Dict[str, object]) -> None:
         index="timestamp", columns="floor_id", values="count", aggfunc="mean"
     )
     st.line_chart(pivot)
+
+    st.subheader("Floor-wise occupancy summary (table)")
+    st.dataframe(floor_summary_df)
 
     st.subheader("Floor schema (structured data)")
     st.json(bundle["floor_schema"])  # type: ignore[arg-type]
