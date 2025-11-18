@@ -32,11 +32,6 @@ except ImportError:  # pragma: no cover - Streamlit not always installed for tes
     st = None  # type: ignore
 
 try:
-    import openai  # type: ignore
-except ImportError:  # pragma: no cover - optional dependency
-    openai = None  # type: ignore
-
-try:
     from openai import OpenAI  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
     OpenAI = None  # type: ignore
@@ -346,21 +341,14 @@ class TripletExtractor:
     def __init__(self, model: str = "gpt-4o-mini"):
         self.model = model
         self.api_key = os.getenv("OPENAI_API_KEY")
-        self.llm_ready = bool(self.api_key and openai)
-        self.client = None
-        self.api_style = "legacy"
-        if self.llm_ready and openai:
-            if OpenAI is not None:
-                try:
-                    self.client = OpenAI(api_key=self.api_key)
-                    self.api_style = "client"
-                except Exception as exc:  # pragma: no cover - depends on external API
-                    print(f"[TripletExtractor] OpenAI client init failed ({exc}); using legacy mode.")
-                    if hasattr(openai, "api_key"):
-                        openai.api_key = self.api_key
-            else:
-                if hasattr(openai, "api_key"):
-                    openai.api_key = self.api_key
+        self.client: Optional["OpenAI"] = None
+        self.llm_ready = bool(self.api_key and OpenAI is not None)
+        if self.llm_ready:
+            try:
+                self.client = OpenAI(api_key=self.api_key)
+            except Exception as exc:  # pragma: no cover - depends on external API
+                print(f"[TripletExtractor] OpenAI client init failed ({exc}); falling back to heuristics.")
+                self.llm_ready = False
 
     def extract(self, memos: Sequence[str]) -> List[Dict[str, str]]:
         if self.llm_ready:
@@ -371,6 +359,8 @@ class TripletExtractor:
         return self._heuristic_extract(memos)
 
     def _extract_with_llm(self, memos: Sequence[str]) -> List[Dict[str, str]]:
+        if not self.client:
+            raise RuntimeError("OpenAI client not initialized")
         joined = "\n\n".join(memos)
         prompt = (
             "Extract building knowledge triplets from the memos below. "
@@ -379,27 +369,15 @@ class TripletExtractor:
             "Use short predicate names (status, reservedFor, event, restriction).\n\n"
             f"Memos:\n{joined}"
         )
-        content: Optional[str] = None
-        if self.api_style == "client" and self.client is not None:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "You convert text into RDF-style triplets."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.0,
-            )
-            content = response.choices[0].message.content
-        elif openai is not None:
-            response = openai.ChatCompletion.create(  # type: ignore[attr-defined]
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "You convert text into RDF-style triplets."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.0,
-            )
-            content = response["choices"][0]["message"]["content"]
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": "You convert text into RDF-style triplets."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,
+        )
+        content = response.choices[0].message.content
         if not content:
             raise RuntimeError("LLM content not returned")
         try:
@@ -827,21 +805,14 @@ class LLMExplainer:
         self.query_engine = query_engine
         self.model = model
         self.api_key = os.getenv("OPENAI_API_KEY")
-        self.llm_ready = bool(self.api_key and openai)
-        self.client = None
-        self.api_style = "legacy"
-        if self.llm_ready and openai:
-            if OpenAI is not None:
-                try:
-                    self.client = OpenAI(api_key=self.api_key)
-                    self.api_style = "client"
-                except Exception as exc:  # pragma: no cover - depends on external API
-                    print(f"[LLMExplainer] OpenAI client init failed ({exc}); using legacy mode.")
-                    if hasattr(openai, "api_key"):
-                        openai.api_key = self.api_key
-            else:
-                if hasattr(openai, "api_key"):
-                    openai.api_key = self.api_key
+        self.client: Optional["OpenAI"] = None
+        self.llm_ready = bool(self.api_key and OpenAI is not None)
+        if self.llm_ready:
+            try:
+                self.client = OpenAI(api_key=self.api_key)
+            except Exception as exc:  # pragma: no cover - depends on external API
+                print(f"[LLMExplainer] OpenAI client init failed ({exc}); falling back to offline reasoning.")
+                self.llm_ready = False
 
     def answer(self, question: str) -> Tuple[str, str, List[ContextGap]]:
         context, floors, date, gaps = self.query_engine.retrieve_context(question)
@@ -857,34 +828,18 @@ class LLMExplainer:
         return fallback, context, []
 
     def _answer_with_llm(self, question: str, context: str) -> str:
-        if self.api_style == "client" and self.client is not None:
-            completion = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a workplace operations analyst. Use only the provided facts "
-                            "to explain occupancy anomalies. Reference floor numbers explicitly."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": f"Question: {question}\n\nFacts:\n{context}",
-                    },
-                ],
-                temperature=0.2,
-            )
-            return completion.choices[0].message.content.strip()
-        assert openai is not None  # fallback for mypy
-        completion = openai.ChatCompletion.create(  # type: ignore[attr-defined]
+        if not self.client:
+            raise RuntimeError("OpenAI client not initialized")
+        completion = self.client.chat.completions.create(
             model=self.model,
             messages=[
                 {
                     "role": "system",
                     "content": (
-                        "You are a workplace operations analyst. Use only the provided facts "
-                        "to explain occupancy anomalies. Reference floor numbers explicitly."
+                        "You are a concise workplace operations analyst. Use only the provided facts, "
+                        "infer missing links when reasonable, and NEVER restate the user's question. "
+                        "Organize the answer as two short paragraphs or a short bullet list. "
+                        "Emphasize causes, cite floors by number, and mention any memo or override evidence."
                     ),
                 },
                 {
@@ -894,7 +849,7 @@ class LLMExplainer:
             ],
             temperature=0.2,
         )
-        return completion["choices"][0]["message"]["content"].strip()
+        return completion.choices[0].message.content.strip()
 
     def _fallback_answer(self, question: str, context: str, error: Optional[str] = None) -> str:
         summaries = _summarize_context(context)
@@ -919,6 +874,8 @@ class LLMExplainer:
         return self._gap_response_plain(question, gaps)
 
     def _gap_response_with_llm(self, question: str, gaps: Sequence[ContextGap]) -> str:
+        if not self.client:
+            raise RuntimeError("OpenAI client not initialized")
         payload = [
             {
                 "reason": gap.reason,
@@ -937,18 +894,7 @@ class LLMExplainer:
             f"Original question: {question}\n"
             f"Gaps JSON:\n{json.dumps(payload, indent=2)}"
         )
-        if self.api_style == "client" and self.client is not None:
-            completion = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "You request clarifying workplace context in natural language."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.3,
-            )
-            return completion.choices[0].message.content.strip()
-        assert openai is not None
-        completion = openai.ChatCompletion.create(  # type: ignore[attr-defined]
+        completion = self.client.chat.completions.create(
             model=self.model,
             messages=[
                 {"role": "system", "content": "You request clarifying workplace context in natural language."},
@@ -956,7 +902,7 @@ class LLMExplainer:
             ],
             temperature=0.3,
         )
-        return completion["choices"][0]["message"]["content"].strip()
+        return completion.choices[0].message.content.strip()
 
     def _gap_response_plain(
         self, question: str, gaps: Sequence[ContextGap], error: Optional[str] = None
