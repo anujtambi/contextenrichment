@@ -42,6 +42,7 @@ WEEK_START = datetime(2025, 6, 9, 6, 0, 0)
 WEEK_DAYS = 7
 HOURS = range(7, 20)  # 7:00 through 19:00 inclusive
 TABLE_REQUEST_PATTERN = re.compile(r"\b(table|tabular|grid|matrix)\b", re.IGNORECASE)
+CHART_REQUEST_PATTERN = re.compile(r"\b(chart|plot|graph|visual(?:ization)?)\b", re.IGNORECASE)
 
 DEMO_EXAMPLES = [
     {
@@ -867,12 +868,18 @@ class LLMExplainer:
     def answer(self, question: str) -> Tuple[str, str, List[ContextGap]]:
         context, floors, date, gaps = self.query_engine.retrieve_context(question)
         wants_table = bool(TABLE_REQUEST_PATTERN.search(question))
+        wants_chart = bool(CHART_REQUEST_PATTERN.search(question))
         table_markdown = self.query_engine.floor_summary_markdown() if wants_table else ""
         reasoning_context = context
         if table_markdown:
             reasoning_context = (
                 f"{context}\n\nFloor summary table (Markdown):\n{table_markdown}\n"
                 "Please include this table (or a faithful subset) in your response."
+            )
+        if wants_chart:
+            reasoning_context = (
+                f"{reasoning_context}\n\nIf possible, describe the comparative trend and mention that a chart "
+                "can be rendered in the Streamlit panel. Use concise language."
             )
         if gaps:
             answer_text = self._gap_response(question, gaps)
@@ -886,8 +893,16 @@ class LLMExplainer:
                     answer_text = self._fallback_answer(question, reasoning_context, error=str(exc))
             else:
                 answer_text = self._fallback_answer(question, reasoning_context)
+        footers: List[str] = []
         if table_markdown:
-            answer_text = f"{answer_text}\n\nRequested table:\n{table_markdown}"
+            footers.append("Requested table:\n" + table_markdown)
+        if wants_chart:
+            footers.append(
+                "Chart hint: the Streamlit UI now renders a floor-wise occupancy bar chart. "
+                "If you're in CLI mode, review the table above for the same values."
+            )
+        if footers:
+            answer_text = f"{answer_text}\n\n" + "\n\n".join(footers)
         return answer_text, context, gap_list
 
     def _answer_with_llm(self, question: str, context: str) -> str:
@@ -1181,27 +1196,35 @@ def render_streamlit_app(bundle: Dict[str, object]) -> None:
         "Type a question about occupancy anomalies",
         value="Why is Floor 5 almost empty on Monday?",
     )
+    table_req = bool(question and TABLE_REQUEST_PATTERN.search(question))
+    chart_req = bool(question and CHART_REQUEST_PATTERN.search(question))
     if question:
         answer, supporting_facts, _ = explainer.answer(question)
         st.markdown("**Answer**")
         st.write(answer)
         with st.expander("Retrieved fact sheet"):
             st.text(supporting_facts)
+        if chart_req:
+            st.session_state["chart_request"] = {"source": "question", "text": question}
 
     st.subheader("Chat with the context-aware assistant")
     if "chat_messages" not in st.session_state:
         st.session_state["chat_messages"] = [_default_chatbot_message()]
     if "pending_context_request" not in st.session_state:
         st.session_state["pending_context_request"] = None
+    if "chart_request" not in st.session_state:
+        st.session_state["chart_request"] = None
     if st.button("Clear chat history", key="clear_chat_history"):
         st.session_state["chat_messages"] = [_default_chatbot_message()]
         st.session_state["pending_context_request"] = None
+        st.session_state["chart_request"] = None
     chat_messages = st.session_state["chat_messages"]
     chat_prompt = st.chat_input("Start a conversation about occupancy, policies, or memos")
     if chat_prompt:
         chat_messages.append({"role": "user", "content": chat_prompt})
         pending_request = st.session_state.get("pending_context_request")
         handled_context = False
+        chart_requested = bool(CHART_REQUEST_PATTERN.search(chat_prompt))
         if pending_request and pending_request.get("floor_id") and pending_request.get("predicate"):
             recorded = record_context_entry(
                 pending_request["floor_id"],
@@ -1235,6 +1258,8 @@ def render_streamlit_app(bundle: Dict[str, object]) -> None:
             st.session_state["pending_context_request"] = next_request
         elif handled_context:
             st.session_state["pending_context_request"] = None
+        if chart_requested:
+            st.session_state["chart_request"] = {"source": "chat", "text": chat_prompt}
     for message in chat_messages:
         role = message.get("role", "assistant")
         content = message.get("content", "")
@@ -1244,6 +1269,18 @@ def render_streamlit_app(bundle: Dict[str, object]) -> None:
             if supporting:
                 with st.expander("Retrieved fact sheet", expanded=False):
                     st.text(supporting)
+
+    chart_request = st.session_state.get("chart_request")
+    if chart_request:
+        st.subheader("Requested chart")
+        chart_df = floor_summary_df.set_index("Floor")[["AvgOccupancy", "Peak", "Low"]]
+        st.bar_chart(chart_df)
+        st.caption(
+            f"Chart generated from the latest floor summary (triggered via {chart_request['source']}: "
+            f"“{chart_request['text']}”)."
+        )
+        if st.button("Clear chart request", key="clear_chart_request"):
+            st.session_state["chart_request"] = None
 
     st.caption(
         "Demo data is synthetic. Knowledge graph built with RDFLib; sensor readings linked to floor entities."
