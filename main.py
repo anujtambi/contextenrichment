@@ -43,6 +43,15 @@ WEEK_DAYS = 7
 HOURS = range(7, 20)  # 7:00 through 19:00 inclusive
 TABLE_REQUEST_PATTERN = re.compile(r"\b(table|tabular|grid|matrix)\b", re.IGNORECASE)
 CHART_REQUEST_PATTERN = re.compile(r"\b(chart|plot|graph|visual(?:ization)?)\b", re.IGNORECASE)
+FLOOR_ID_PATTERN = re.compile(r"floor\s*(\d)", re.IGNORECASE)
+INLINE_CONTEXT_TRIGGER = re.compile(
+    r"\b(i\s+(?:believe|think)|add(?:ing)?\s+context|context\s+note|for\s+context|note\s+that|"
+    r"there\s+is|there's|kept\s+to|used\s+for|because|due\s+to|fyi)\b",
+    re.IGNORECASE,
+)
+STORAGE_KEYWORDS = re.compile(r"\b(storage|store|warehouse|inventory|large\s+items?)\b", re.IGNORECASE)
+EVENT_KEYWORDS = re.compile(r"\b(event|summit|training|meeting|briefing)\b", re.IGNORECASE)
+MIN_INLINE_CONTEXT_LEN = 24
 
 DEMO_EXAMPLES = [
     {
@@ -368,6 +377,24 @@ def create_floor_summary_df(
     return summary
 
 
+def extract_inline_context(message: str) -> Optional[Tuple[str, str, str]]:
+    if len(message.strip()) < MIN_INLINE_CONTEXT_LEN:
+        return None
+    if not INLINE_CONTEXT_TRIGGER.search(message):
+        return None
+    floor_matches = FLOOR_ID_PATTERN.findall(message)
+    if not floor_matches:
+        return None
+    floor_id = f"Floor{floor_matches[-1]}"
+    predicate = "userNote"
+    if STORAGE_KEYWORDS.search(message):
+        predicate = "storageNote"
+    elif EVENT_KEYWORDS.search(message):
+        predicate = "eventNote"
+    value = message.strip()
+    return floor_id, predicate, value
+
+
 class TripletExtractor:
     """Extract subject-predicate-object triplets from unstructured memos."""
 
@@ -571,7 +598,7 @@ class KnowledgeGraphBuilder:
 class GraphQueryEngine:
     """Helper to retrieve facts relevant to a natural-language question."""
 
-    FLOOR_PATTERN = re.compile(r"floor\s*(\d)", re.IGNORECASE)
+    FLOOR_PATTERN = FLOOR_ID_PATTERN
     DATE_PATTERN = re.compile(r"(June|Jun)\s+(\d{1,2})", re.IGNORECASE)
     MONTHS = {"june": 6, "jun": 6}
     PEER_HINTS = {
@@ -1127,11 +1154,21 @@ def render_streamlit_app(bundle: Dict[str, object]) -> None:
         "with floor policies and memos, and uses a knowledge graph to answer questions."
     )
 
+    def _sync_bundle_state(updated: Dict[str, object]) -> None:
+        nonlocal bundle, artifacts, explainer, occupancy_df, floor_summary_df
+        bundle = updated
+        artifacts = bundle["artifacts"]  # type: ignore[assignment]
+        explainer = bundle["explainer"]  # type: ignore[assignment]
+        occupancy_df = bundle["occupancy_df"]  # type: ignore[assignment]
+        floor_summary_df = bundle["floor_summary"]  # type: ignore[assignment]
+
     def _refresh_bundle() -> Dict[str, object]:
         updated = _build_data_bundle()
         st.session_state["data_bundle"] = updated
+        _sync_bundle_state(updated)
         return updated
 
+    _sync_bundle_state(bundle)
     artifacts: Dict[str, Path] = bundle["artifacts"]  # type: ignore[assignment]
     st.sidebar.header("Saved artifacts")
     for label, path in artifacts.items():
@@ -1199,6 +1236,15 @@ def render_streamlit_app(bundle: Dict[str, object]) -> None:
     table_req = bool(question and TABLE_REQUEST_PATTERN.search(question))
     chart_req = bool(question and CHART_REQUEST_PATTERN.search(question))
     if question:
+        inline_context = extract_inline_context(question)
+        if inline_context:
+            floor_id, predicate, value = inline_context
+            recorded = record_context_entry(floor_id, predicate, value, "inline_question_note")
+            _refresh_bundle()
+            st.success(
+                f"Saved your note for {recorded['floor_id']} ({recorded['predicate']}). "
+                "The answer below includes this new context."
+            )
         answer, supporting_facts, _ = explainer.answer(question)
         st.markdown("**Answer**")
         st.write(answer)
@@ -1225,6 +1271,16 @@ def render_streamlit_app(bundle: Dict[str, object]) -> None:
         pending_request = st.session_state.get("pending_context_request")
         handled_context = False
         chart_requested = bool(CHART_REQUEST_PATTERN.search(chat_prompt))
+        inline_context = extract_inline_context(chat_prompt)
+        if inline_context:
+            floor_id, predicate, value = inline_context
+            recorded = record_context_entry(floor_id, predicate, value, "inline_chat_note")
+            _refresh_bundle()
+            ack_inline = (
+                f"Logged your note for {recorded['floor_id']} ({recorded['predicate']}): "
+                f"\"{recorded['value'][:160]}\""
+            )
+            chat_messages.append({"role": "assistant", "content": ack_inline})
         if pending_request and pending_request.get("floor_id") and pending_request.get("predicate"):
             recorded = record_context_entry(
                 pending_request["floor_id"],
